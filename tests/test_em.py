@@ -529,3 +529,184 @@ def test_mvn_rejects_a_different_width_at_predict_time(two_blobs):
     model = EM("multivariate-normal", seed=0).train(two_blobs, n_groups=2, n_init=2)
     with pytest.raises(ValueError, match="fitted on 2 features"):
         model.predict_proba(two_blobs[:, :1])
+
+
+# --- anchors (semi-supervised EM) --------------------------------------------
+
+@pytest.fixture
+def overlapping_pair():
+    """Two unit normals 1.2 apart, with the generating component of each point."""
+    rng = np.random.default_rng(31)
+    n = 3_000
+    x = np.concatenate([rng.normal(0.0, 1.0, n), rng.normal(1.2, 1.0, n)])
+    truth = np.concatenate([np.zeros(n, dtype=int), np.ones(n, dtype=int)])
+    return x, truth
+
+
+def anchor(truth, fraction, seed=0):
+    """Reveal a random fraction of the true labels; -1 everywhere else."""
+    rng = np.random.default_rng(seed)
+    labels = np.full(truth.shape, -1)
+    picked = rng.choice(truth.size, size=int(fraction * truth.size), replace=False)
+    labels[picked] = truth[picked]
+    return labels
+
+
+def test_anchors_fix_the_component_indices(overlapping_pair):
+    """Component k is the one the anchors call k, so labels stop being arbitrary."""
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.03)
+    model = EM("normal", seed=0).train(x, n_groups=2, n_init=4, labels=labels)
+    assert model.params_[0, 0] < model.params_[1, 0]
+    assert np.allclose(model.params_[:, 0], [0.0, 1.2], atol=0.15)
+    assert (model.classify() == truth).mean() > 0.7  # no need to try both orderings
+
+    swapped = np.where(labels >= 0, 1 - labels, -1)
+    other = EM("normal", seed=0).train(x, n_groups=2, n_init=4, labels=swapped)
+    assert np.allclose(other.params_[::-1], model.params_)
+    assert np.allclose(other.weights_[::-1], model.weights_)
+
+
+def test_anchored_rows_are_pinned_in_the_training_posterior(overlapping_pair):
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.05)
+    model = EM("normal", seed=0).train(x, n_groups=2, n_init=2, labels=labels)
+    rows = np.flatnonzero(labels >= 0)
+    cached = model.predict_proba()
+    assert np.allclose(cached[rows, labels[rows]], 1.0)
+    assert np.allclose(cached.sum(axis=1), 1.0)
+    # The unconstrained posterior for the same points is not degenerate.
+    free = model.predict_proba(x)
+    assert not np.allclose(free[rows, labels[rows]], 1.0)
+    assert np.array_equal(model.labels_, labels)
+
+
+def test_anchored_loglikelihood_increases_monotonically(overlapping_pair):
+    """Pinning is a proper likelihood, so EM's guarantee still holds."""
+    x, truth = overlapping_pair
+    model = EM("normal", seed=0).train(x, n_groups=2, n_init=1, labels=anchor(truth, 0.1))
+    history = np.asarray(model.loglike_history_)
+    assert np.all(np.diff(history) >= -1e-8)
+    assert model.converged_
+
+
+def test_anchored_objective_matches_a_hand_computation(overlapping_pair):
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.1)
+    model = EM("normal", seed=0).train(x, n_groups=2, n_init=1, labels=labels)
+    log_joint = model.loglike(with_priors=False) + np.log(model.weights_)
+    rows = np.flatnonzero(labels >= 0)
+    expected = model.loglike().copy()
+    expected[rows] = log_joint[rows, labels[rows]]
+    _, total = model.e_step(x, model.weights_, model.params_, labels)
+    assert np.isclose(total, expected.sum())
+    assert np.isclose(model.loglike_history_[-1], expected.sum())
+
+
+def test_anchors_rescue_a_fit_the_data_alone_cannot_identify():
+    """Two components with the same mean and different spread.
+
+    Unsupervised EM has no way to tell which index is 'wide'; anchors decide.
+    """
+    rng = np.random.default_rng(8)
+    n = 2_500
+    x = np.concatenate([rng.normal(0.0, 1.0, n), rng.normal(0.0, 4.0, n)])
+    truth = np.concatenate([np.zeros(n, dtype=int), np.ones(n, dtype=int)])
+    model = EM("normal", seed=0).train(x, n_groups=2, n_init=3, labels=anchor(truth, 0.05))
+    assert np.allclose(model.params_[:, 1], [1.0, 4.0], atol=0.3)
+
+
+def test_fully_anchored_fit_is_the_supervised_mle(overlapping_pair):
+    """With every point labeled there is nothing to infer: one M-step, exact."""
+    x, truth = overlapping_pair
+    model = EM("normal", seed=0).train(x, n_groups=2, labels=truth)
+    for k in (0, 1):
+        part = x[truth == k]
+        assert np.allclose(model.params_[k], [part.mean(), part.std()], rtol=1e-6)
+    assert np.allclose(model.weights_, np.bincount(truth) / truth.size)
+
+
+def test_unlabeled_everywhere_is_plain_em(overlapping_pair):
+    x, _ = overlapping_pair
+    plain = EM("normal", seed=0).train(x, n_groups=2, n_init=2)
+    empty = EM("normal", seed=0).train(x, n_groups=2, n_init=2, labels=np.full(x.size, -1))
+    assert np.allclose(plain.params_, empty.params_)
+    assert empty.labels_ is None
+
+
+def test_labels_accept_nan_and_none_for_unknown(overlapping_pair):
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.05)
+    reference = EM("normal", seed=0).train(x, n_groups=2, labels=labels)
+    as_float = np.where(labels < 0, np.nan, labels).astype(float)
+    as_object = [None if v < 0 else int(v) for v in labels]
+    for variant in (as_float, as_object):
+        model = EM("normal", seed=0).train(x, n_groups=2, labels=variant)
+        assert np.allclose(model.params_, reference.params_)
+
+
+def test_labels_are_validated(overlapping_pair):
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.05)
+    with pytest.raises(ValueError, match="entries but X has"):
+        EM("normal").train(x, n_groups=2, labels=labels[:-1])
+    with pytest.raises(ValueError, match=r"lie in \[0, 2\)"):
+        EM("normal").train(x, n_groups=2, labels=np.where(labels == 0, 2, labels))
+    with pytest.raises(ValueError, match=r"lie in \[0, 2\)"):
+        EM("normal").train(x, n_groups=2, labels=np.where(labels == 0, -2, labels))
+    with pytest.raises(ValueError, match="integer component indices"):
+        EM("normal").train(x, n_groups=2, labels=np.where(labels == 0, 0.5, labels).astype(float))
+    with pytest.raises(ValueError, match="integer component indices"):
+        EM("normal").train(x, n_groups=2, labels=["a"] * x.size)
+
+
+def test_anchors_are_reproducible_and_reported(overlapping_pair):
+    x, truth = overlapping_pair
+    labels = anchor(truth, 0.05)
+    a = EM("normal", seed=3).train(x, n_groups=2, n_init=3, labels=labels)
+    b = EM("normal", seed=3).train(x, n_groups=2, n_init=3, labels=labels)
+    assert np.allclose(a.params_, b.params_)
+    assert f"{int((labels >= 0).sum())} anchors" in a.summary()
+
+
+def test_anchors_seed_the_regression_lines(two_lines):
+    """A few labeled points per line pin which index each line gets."""
+    x, y, n = two_lines
+    labels = np.full(2 * n, -1)
+    labels[:15] = 0
+    labels[n:n + 15] = 1
+    model = EM("linear-regression", seed=0).train(x, n_groups=2, n_init=3, y=y, labels=labels)
+    assert np.allclose(model.params_[0], [2.0, 3.0, 0.6], atol=0.15)
+    assert np.allclose(model.params_[1], [10.0, -1.5, 0.9], atol=0.15)
+    truth = np.concatenate([np.zeros(n), np.ones(n)])
+    assert (model.classify() == truth).mean() > 0.9
+
+
+def test_anchors_on_a_multivariate_mixture(two_blobs):
+    labels = np.full(two_blobs.shape[0], -1)
+    labels[:25] = 1        # the first blob is index 1 this time
+    labels[3_000:3_025] = 0
+    model = EM("multivariate-normal", seed=0).train(two_blobs, n_groups=2, n_init=3, labels=labels)
+    assert np.allclose(model.params_[1, :2], [-2.0, 1.0], atol=0.12)
+    assert np.allclose(model.params_[0, :2], [3.0, 2.0], atol=0.15)
+
+
+def test_anchors_with_a_custom_loglike(overlapping_pair):
+    x, truth = overlapping_pair
+    model = EM(
+        laplace_loglike,
+        n_params=2,
+        param_bounds=[(None, None), (1e-6, None)],
+        init_params=[0.0, 1.0],
+        seed=0,
+    ).train(x, n_groups=2, n_init=2, labels=anchor(truth, 0.05))
+    assert model.params_[0, 0] < model.params_[1, 0]
+    assert np.all(np.isfinite(model.params_))
+
+
+def test_context_manager_drops_the_anchors(overlapping_pair):
+    x, truth = overlapping_pair
+    with EM("normal", seed=0) as model:
+        model.train(x, n_groups=2, labels=anchor(truth, 0.05))
+    assert model.labels_ is None
+    assert model.X_ is None

@@ -1,4 +1,4 @@
-# em
+# em-fit
 
 Expectation-maximization for finite mixture models.
 
@@ -36,7 +36,7 @@ posterior = model.predict_proba()  # responsibilities, shape (n_samples, 2)
 
 ```bash
 uv sync          # runtime + dev + examples, project installed editable
-uv run pytest    # 56 tests
+uv run pytest    # 70 tests
 ```
 
 ## Built-in families
@@ -109,6 +109,55 @@ A few consequences worth knowing:
 - **`sample()` is unavailable.** Drawing from `p(y | x)` needs predictors to
   condition on; generate `X` yourself and draw `y ~ Normal(X @ beta, sigma)`.
 
+## Anchors: semi-supervised EM
+
+If the component of some observations is already known, pass those labels as
+*anchors*. Every other entry is `-1` (or `NaN`, or `None`):
+
+```python
+labels = np.full(x.size, -1)
+labels[known_idx] = known_component        # a few percent is plenty
+
+model = EM("normal", seed=0).train(x, n_groups=2, n_init=4, labels=labels)
+print(model.summary())
+# EM(normal) with 2 groups, converged, 200 anchors
+```
+
+An anchored observation has its responsibility pinned to its component in every
+E-step, and contributes the complete-data term `log w_k + log f(x | p_k)` to
+the objective instead of the marginal `log Σ_k`. That objective is still a
+likelihood, so the trace stays monotone and convergence is unchanged. It works
+with every family, including custom log-likelihoods and mixtures of regressions.
+
+What a few anchors buy:
+
+- **Named components.** Component `k` *is* the one the anchors call `k`, so
+  `classify()` needs no relabeling afterwards and a group index means the same
+  thing across fits and datasets.
+- **The right optimum.** Where the unlabeled likelihood has several near-equal
+  optima (heavily overlapping components, mixtures of regressions), the anchors
+  pick the one that agrees with the labels. In `examples/mixture_anchored.py`
+  two unit normals 1.5 apart put plain EM on a lopsided optimum at 74% accuracy
+  in 697 iterations; 2% anchors take it to within half a point of the
+  77.2% Bayes rate, in 203.
+- **Identifiability the data cannot supply.** Two components with the same
+  mean and different spread, or a small component under a large one, can only
+  be told apart by convention without labels.
+
+Every initialization is aligned to the anchors before the first M-step: the
+quantile or k-means++ clusters are permuted to agree with the labels as much as
+possible, and for a regression each anchored component is seeded from its own
+anchors.
+
+Two things to know. `predict_proba()` with no argument returns the training
+responsibilities, in which anchors are exactly one-hot; pass `X` explicitly to
+get the unconstrained posterior the fitted mixture assigns them. And
+`loglike()`, `score()`, `aic()` and `bic()` are the marginal mixture density
+regardless of labels, so they stay comparable across label sets; the
+semi-supervised objective the fit maximized is `loglike_history_`, and is what
+`summary()` reports. A fully labeled sample skips inference entirely and gives
+the supervised per-component MLE.
+
 ## Choosing the number of groups
 
 EM maximizes the likelihood, which always improves with more components, so the
@@ -177,6 +226,7 @@ a fork of somebody's mixture library.
 uv run python examples/mixture_1d.py          # 1-D density mixture
 uv run python examples/mixture_2d.py          # 2-D density mixture
 uv run python examples/mixture_regression.py  # mixture of regressions
+uv run python examples/mixture_anchored.py    # semi-supervised, with anchors
 ```
 
 Each writes a PNG next to itself; pass `--show` to open a window instead.
@@ -196,6 +246,13 @@ Each writes a PNG next to itself; pass `--show` to open a window instead.
   σ≈**0.69**, and assigns 97.1% of the points to the right line. The fourth
   panel maps assignment *certainty*, which is where the crossing shows up:
   near the origin no model could tell the lines apart.
+- **`mixture_anchored.py`** hides two unit normals 1.5 apart and reveals the
+  label of 2% of the points. The panels are the data with the anchors as a
+  rug, accuracy on the *unlabeled* points as the anchored fraction grows from
+  0% to 20% against the Bayes rate, the semi-supervised log-likelihood trace,
+  and the fitted `P(group 1 | x)` against the true posterior. Plain EM stops at
+  **74.0%**; from 1% anchored the fit sits at the **77.2%** Bayes rate, with the
+  component indices fixed by the labels rather than by luck.
 
 Plotting is not a runtime dependency; matplotlib lives in the `examples`
 dependency group, which `uv sync` installs by default.
@@ -211,6 +268,7 @@ below); they differ in what they will fit at all.
 | Non-Gaussian families (`lognormal`, `exponential`, `poisson`, `gamma`) | yes | no |
 | **Custom log-density** | **yes, pass a callable** | no, only by subclassing the private `BaseMixture` |
 | Mixtures of regressions | yes | no |
+| Semi-supervised fit (anchors: partial labels) | yes | no |
 | Covariance types | full | full, tied, diag, spherical |
 | Bayesian / Dirichlet-process mixtures | no | yes |
 | Warm start, explicit initial means | no | yes |
@@ -220,8 +278,8 @@ below); they differ in what they will fit at all.
 
 Use sklearn for a Gaussian mixture, especially inside an existing pipeline or
 when you need constrained covariances. Use `em` when the components are not
-Gaussian, when you want to write the density yourself, or when you are fitting
-a mixture of regressions.
+Gaussian, when you want to write the density yourself, when some observations
+come with known labels, or when you are fitting a mixture of regressions.
 
 ## Benchmark
 
@@ -284,15 +342,16 @@ the matcher rather than of the fit: it inflated `2-D, overlapping` from 0.391 to
 | | |
 |---|---|
 | `EM(loglike_fn, *, n_params, param_bounds, init_params, reg, tol, seed)` | construct |
-| `.train(X, n_groups, n_iters=1000, n_init=1, *, y=None)` | fit; returns `self` |
+| `.train(X, n_groups, n_iters=1000, n_init=1, *, y=None, labels=None)` | fit; returns `self`. `labels` are anchors, `-1` where unknown |
 | `.classify(X=None, *, y=None)` | integer labels |
 | `.predict_proba(X=None, *, y=None)` | responsibilities |
 | `.loglike(X=None, with_priors=True, *, y=None)` | mixture log-density, or per-component if `with_priors=False` |
 | `.score / .aic / .bic / .n_free_params` | model comparison |
 | `.sample(n_samples, seed=None)` | draw from the fitted mixture |
 | `.summary()` | printable fit report |
-| `.e_step / .m_step` | the two halves, exposed for inspection |
+| `.e_step(X, weights, params, labels=None) / .m_step` | the two halves, exposed for inspection |
 
 `X=None` reuses the training data. Fitted state lives in `weights_`, `params_`,
-`converged_`, `n_iter_` and `loglike_history_`. Used as a context manager, `EM`
+`converged_`, `n_iter_`, `loglike_history_` and, when anchors were given,
+`labels_`. Used as a context manager, `EM`
 releases the cached training data on exit and keeps the fitted parameters.

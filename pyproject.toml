@@ -1,12 +1,12 @@
 [project]
-name = "em"
+name = "em-fit"
 version = "0.1.0"
 description = "Expectation-maximization for one-dimensional finite mixture models"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.5.2",
-    "scipy>=1.18.1",
+    "numpy>=2.0",
+    "scipy>=1.13",
     "tqdm>=4.66",
 ]
 
