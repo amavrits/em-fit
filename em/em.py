@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable, Sequence
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linear_sum_assignment, minimize
 from tqdm import tqdm
 from em.loglike_fns import Family, LOGLIKE_FNS, get_family
 
@@ -39,6 +39,13 @@ class EM:
     with parameter vector ``p``. Built-ins carry a closed-form weighted MLE, so
     their M-step is exact; a custom callable is maximized numerically with
     L-BFGS-B, which needs ``n_params`` and benefits from ``param_bounds``.
+
+    Observations whose component is already known can be passed to
+    :meth:`train` as *anchors* (``labels=``). Their responsibilities are pinned
+    to the known component in every E-step, which turns the fit into
+    semi-supervised EM: a handful of labeled points is enough to name the
+    components, steer the fit away from a wrong local optimum, and separate
+    components the unlabeled data alone could not tell apart.
 
     Args:
         loglike_fn: Family name, or a custom ``(x, p) -> log-density`` callable.
@@ -97,6 +104,7 @@ class EM:
         self.converged_ = False
         self.n_iter_ = 0
         self.X_: np.ndarray | None = None
+        self.labels_: np.ndarray | None = None
         self.n_features_ = 1
         self._resp: np.ndarray | None = None
 
@@ -150,8 +158,21 @@ class EM:
 
     # -- EM steps -------------------------------------------------------------
 
-    def e_step(self, X: np.ndarray, weights: np.ndarray, params: np.ndarray) -> tuple[np.ndarray, float]:
-        """Responsibilities and the observed-data log-likelihood.
+    def e_step(
+        self,
+        X: np.ndarray,
+        weights: np.ndarray,
+        params: np.ndarray,
+        labels: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, float]:
+        """Responsibilities and the log-likelihood.
+
+        Args:
+            labels: Optional anchors, shape ``(n_samples,)``: the known
+                component of each observation, or ``-1`` where it is unknown.
+                An anchored row gets responsibility 1 on its component and 0
+                elsewhere, and contributes ``log w_k + log f(x | p_k)`` to the
+                total instead of the marginal ``log sum_k``.
 
         Returns:
             ``(log_resp, total_loglike)``, where ``log_resp`` has shape
@@ -159,7 +180,18 @@ class EM:
         """
         log_joint = self._log_joint(X, weights, params)
         log_norm = _rows_logsumexp(log_joint)
-        return log_joint - log_norm[:, None], float(np.sum(log_norm))
+        log_resp = log_joint - log_norm[:, None]
+        if labels is not None:
+            rows = np.flatnonzero(labels >= 0)
+            if rows.size:
+                known = labels[rows]
+                # The anchor's own term is its complete-data log-likelihood,
+                # so the objective stays a proper likelihood and EM's
+                # monotonicity survives the pinning.
+                log_norm[rows] = log_joint[rows, known]
+                log_resp[rows] = -np.inf
+                log_resp[rows, known] = 0.0
+        return log_resp, float(np.sum(log_norm))
 
     def m_step(self, X: np.ndarray, log_resp: np.ndarray, params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Re-fit the mixing weights and per-component parameters.
@@ -185,6 +217,7 @@ class EM:
         n_init: int = 1,
         *,
         y: np.ndarray | None = None,
+        labels: np.ndarray | Sequence | None = None,
     ) -> "EM":
         """Fit the mixture to ``X``.
 
@@ -201,6 +234,13 @@ class EM:
             y: Targets, shape ``(n_samples,)``. Required for a conditional
                 family such as ``"linear-regression"``, which models
                 ``p(y | x)``; rejected for the density families.
+            labels: Anchors, shape ``(n_samples,)``: the component index of
+                every observation whose component is known, and ``-1`` (or
+                ``NaN``/``None``) where it is not. Anchored observations keep
+                their component through the whole fit, and component ``k`` is
+                by definition the one the anchors labeled ``k``, so the fitted
+                indices are no longer arbitrary. Every initialization is
+                aligned to the anchors before the first M-step.
 
         Returns:
             ``self``, so calls can be chained.
@@ -223,6 +263,7 @@ class EM:
             raise ValueError("n_iters must be at least 1.")
         if n_init < 1:
             raise ValueError("n_init must be at least 1.")
+        anchors = self._check_labels(labels, x.shape[0], n_groups)
 
         rng = np.random.default_rng(self.seed)
         best: dict | None = None
@@ -233,7 +274,8 @@ class EM:
             for attempt in range(n_init):
                 try:
                     fit = self._fit_once(
-                        x, n_groups, n_iters, rng, deterministic=(attempt == 0), bar=bar
+                        x, n_groups, n_iters, rng, deterministic=(attempt == 0), bar=bar,
+                        labels=anchors,
                     )
                 except (FloatingPointError, ValueError) as exc:
                     failures.append(str(exc))
@@ -248,6 +290,7 @@ class EM:
             )
 
         self.X_ = x
+        self.labels_ = anchors
         self.weights_ = best["weights"]
         self.params_ = best["params"]
         self.loglike_history_ = best["history"]
@@ -264,6 +307,7 @@ class EM:
         rng: np.random.Generator,
         deterministic: bool,
         bar: "tqdm | None" = None,
+        labels: np.ndarray | None = None,
     ) -> dict:
         """Run EM to convergence from one initialization.
 
@@ -276,10 +320,13 @@ class EM:
             # is meaningless here: seed each component from its own random
             # subsample instead, which gives genuinely different starting fits.
             weights = np.full(n_groups, 1.0 / n_groups)
-            params = self._init_lines(x, n_groups, n_params, rng)
-            return self._em_loop(x, weights, params, n_iters, bar)
+            params = self._init_lines(x, n_groups, n_params, rng, labels)
+            return self._em_loop(x, weights, params, n_iters, bar, labels)
 
-        log_resp = np.log(self._init_resp(x, n_groups, rng, deterministic))
+        # Anchored rows are exact zeros off their component, and log(0) is the
+        # -inf the E-step would produce for them anyway.
+        with np.errstate(divide="ignore"):
+            log_resp = np.log(self._init_resp(x, n_groups, rng, deterministic, labels))
         if self.custom_loglike:
             # Fit the whole sample once, so every component's numerical M-step
             # starts from a sane point rather than from init_params directly.
@@ -288,7 +335,7 @@ class EM:
         else:
             params = np.zeros((n_groups, n_params))
         weights, params = self.m_step(x, log_resp, params)
-        return self._em_loop(x, weights, params, n_iters, bar)
+        return self._em_loop(x, weights, params, n_iters, bar, labels)
 
     def _em_loop(
         self,
@@ -297,6 +344,7 @@ class EM:
         params: np.ndarray,
         n_iters: int,
         bar: "tqdm | None",
+        labels: np.ndarray | None = None,
     ) -> dict:
         """Alternate E and M from the given start until convergence."""
         history: list[float] = []
@@ -304,7 +352,7 @@ class EM:
         converged = False
         n_iter = 0
         for n_iter in range(1, n_iters + 1):
-            log_resp, loglike = self.e_step(x, weights, params)
+            log_resp, loglike = self.e_step(x, weights, params, labels)
             if not np.isfinite(loglike):
                 raise ValueError("The log-likelihood became non-finite; check the data and the family.")
             history.append(loglike)
@@ -332,38 +380,89 @@ class EM:
         }
 
     def _init_resp(
-        self, x: np.ndarray, n_groups: int, rng: np.random.Generator, deterministic: bool
+        self,
+        x: np.ndarray,
+        n_groups: int,
+        rng: np.random.Generator,
+        deterministic: bool,
+        labels: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Build starting responsibilities: a quantile split, else k-means++."""
+        """Build starting responsibilities: a quantile split, else k-means++.
+
+        With anchors, the split's cluster indices are first permuted to agree
+        with the anchors as much as possible, and the anchored rows are then
+        pinned. Without the permutation the anchors and the split would name
+        the same cluster differently, and the first M-step would blend two
+        clusters into one component.
+        """
         rows = x[:, None] if x.ndim == 1 else x
         n_rows = rows.shape[0]
-        resp = np.zeros((n_rows, n_groups))
         if deterministic:
-            resp[np.arange(n_rows), self._ordered_split(rows, n_groups)] = 1.0
+            clusters = self._ordered_split(rows, n_groups)
         else:
             centers = self._kmeanspp(rows, n_groups, rng)
             distance = np.sum((rows[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-            resp[np.arange(n_rows), np.argmin(distance, axis=1)] = 1.0
+            clusters = np.argmin(distance, axis=1)
+        if labels is not None:
+            clusters = self._align_to_anchors(clusters, labels, n_groups)
+
+        resp = np.zeros((n_rows, n_groups))
+        resp[np.arange(n_rows), clusters] = 1.0
 
         # Soften, so that no component starts with exactly zero mass.
         smoothing = 1e-2
-        return (1.0 - smoothing) * resp + smoothing / n_groups
+        resp = (1.0 - smoothing) * resp + smoothing / n_groups
+        if labels is not None:
+            anchored = np.flatnonzero(labels >= 0)
+            resp[anchored] = 0.0
+            resp[anchored, labels[anchored]] = 1.0
+        return resp
+
+    @staticmethod
+    def _align_to_anchors(clusters: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
+        """Relabel ``clusters`` to maximize agreement with the anchors.
+
+        A cluster index is arbitrary; an anchor's is not. The assignment that
+        matches the most anchored rows is a linear assignment problem on the
+        cluster-by-label contingency table.
+        """
+        anchored = labels >= 0
+        table = np.zeros((n_groups, n_groups))
+        np.add.at(table, (clusters[anchored], labels[anchored]), 1.0)
+        cluster_index, component = linear_sum_assignment(table, maximize=True)
+        mapping = np.empty(n_groups, dtype=int)
+        mapping[cluster_index] = component
+        return mapping[clusters]
 
     def _init_lines(
-        self, data: np.ndarray, n_groups: int, n_params: int, rng: np.random.Generator
+        self,
+        data: np.ndarray,
+        n_groups: int,
+        n_params: int,
+        rng: np.random.Generator,
+        labels: np.ndarray | None = None,
     ) -> np.ndarray:
         """Seed a mixture of regressions by fitting random subsamples.
 
         A random *partition* of the data would give every component the same
         line, since each part is a uniform subsample of the whole. Small random
         subsets differ enough to break that symmetry.
+
+        A component with anchors is seeded from them instead: they are the
+        best available guess at its line. If there are too few to determine
+        one, random rows fill the subsample up to its usual size.
         """
         n_rows = data.shape[0]
         size = int(min(n_rows, max(n_params + 1, n_rows // (2 * n_groups))))
         params = []
-        for _ in range(n_groups):
+        for k in range(n_groups):
             w = np.zeros(n_rows)
-            w[rng.choice(n_rows, size=size, replace=False)] = 1.0
+            own = np.flatnonzero(labels == k) if labels is not None else np.empty(0, dtype=int)
+            w[own] = 1.0
+            missing = size - own.size
+            if missing > 0:
+                pool = np.setdiff1d(np.arange(n_rows), own, assume_unique=True)
+                w[rng.choice(pool, size=min(missing, pool.size), replace=False)] = 1.0
             params.append(self.family.mle(data, w, self.reg, np.zeros(n_params)))
         return np.asarray(params, dtype=float)
 
@@ -419,7 +518,13 @@ class EM:
     def predict_proba(
         self, X: np.ndarray | None = None, *, y: np.ndarray | None = None
     ) -> np.ndarray:
-        """Posterior probability of each component for each observation."""
+        """Posterior probability of each component for each observation.
+
+        With ``X=None`` this is the responsibility matrix of the final
+        E-step, in which anchored observations are pinned to their component.
+        Pass the training data explicitly for the unconstrained posterior the
+        fitted mixture assigns to them.
+        """
         self._check_fitted()
         x = self._check_data(X, y, allow_none=True)
         if X is None and self._resp is not None:
@@ -438,6 +543,10 @@ class EM:
                 ``log sum_k w_k f(x | p_k)`` with shape ``(n_samples,)``. If
                 false, return the per-component log-densities *without* the
                 mixing weights, shape ``(n_samples, n_groups)``.
+
+        Anchors do not enter here: this is the marginal density of the fitted
+        mixture, whatever labels were used to fit it. The semi-supervised
+        objective the fit maximized is in ``loglike_history_``.
         """
         self._check_fitted()
         x = self._check_data(X, y, allow_none=True)
@@ -486,6 +595,8 @@ class EM:
         """One line per component: weight and fitted parameters."""
         self._check_fitted()
         status = "converged" if self.converged_ else f"stopped at {self.n_iter_} iterations"
+        if self.labels_ is not None and np.any(self.labels_ >= 0):
+            status += f", {int(np.sum(self.labels_ >= 0))} anchors"
         lines = [f"EM({self.family.name}) with {self.weights_.size} groups, {status}"]
         order = np.argsort(-self.weights_)
         for k in order:
@@ -589,6 +700,35 @@ class EM:
         self.family.validate(x)
         return x
 
+    @staticmethod
+    def _check_labels(
+        labels: np.ndarray | Sequence | None, n_samples: int, n_groups: int
+    ) -> np.ndarray | None:
+        """Validate anchors into an int array with ``-1`` for the unlabeled.
+
+        Accepts ``-1``, ``NaN`` or ``None`` as "unknown", so a labels column
+        from a dataframe drops in whichever convention it uses.
+        """
+        if labels is None:
+            return None
+        raw = np.asarray(labels)
+        if raw.dtype == object:
+            raw = np.array([-1 if v is None else v for v in raw.ravel()], dtype=float).reshape(raw.shape)
+        if raw.dtype.kind == "f":
+            raw = np.where(np.isnan(raw), -1.0, raw)
+            if not np.all(np.isfinite(raw)) or not np.all(raw == np.round(raw)):
+                raise ValueError("labels must be integer component indices, -1, NaN or None.")
+        elif raw.dtype.kind not in "iub":
+            raise ValueError("labels must be integer component indices, -1, NaN or None.")
+        out = raw.astype(int).ravel()
+        if out.shape[0] != n_samples:
+            raise ValueError(f"labels has {out.shape[0]} entries but X has {n_samples} rows.")
+        if np.any(out < -1) or np.any(out >= n_groups):
+            raise ValueError(f"labels must lie in [0, {n_groups}) or be -1 for unlabeled observations.")
+        if not np.any(out >= 0):
+            return None
+        return out
+
     def _check_fitted(self) -> None:
         if self.params_ is None:
             raise RuntimeError("This EM instance is not fitted yet; call train(X, n_groups) first.")
@@ -604,5 +744,6 @@ class EM:
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         # Drop the cached per-observation arrays; the fitted parameters stay.
         self.X_ = None
+        self.labels_ = None
         self._resp = None
         return False
