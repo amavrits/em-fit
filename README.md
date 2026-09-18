@@ -35,6 +35,12 @@ posterior = model.predict_proba()  # responsibilities, shape (n_samples, 2)
 ## Install
 
 ```bash
+pip install em-fit       # or: uv add em-fit
+```
+
+The package is imported as `em`. To work on it from a clone:
+
+```bash
 uv sync          # runtime + dev + examples, project installed editable
 uv run pytest    # 70 tests
 ```
@@ -452,3 +458,7 @@ the matcher rather than of the fit: it inflated `2-D, overlapping` from 0.391 to
 `converged_`, `n_iter_`, `loglike_history_` and, when anchors were given,
 `labels_`. Used as a context manager, `EM`
 releases the cached training data on exit and keeps the fitted parameters.
+
+## License
+
+MIT. See `LICENSE`.
